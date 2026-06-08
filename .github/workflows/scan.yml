@@ -1,0 +1,39 @@
+name: Daily outperformance scan
+
+# Runs after the US market close. Cron is in UTC and GitHub does NOT adjust for
+# daylight saving, so this fires at 22:00 UTC year-round:
+#   - EDT (summer): 6:00 PM ET  (2h after the 4 PM close)
+#   - EST (winter): 5:00 PM ET  (1h after close)
+# That's enough lag for Yahoo's end-of-day data to settle. Weekdays only.
+# Note: GitHub's scheduler can run a few minutes late under load — that's fine
+# for end-of-day data. You can also trigger it by hand from the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch: {}   # manual "Run workflow" button
+
+# Avoid overlapping runs if one is slow.
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}   # optional; defaults to https://ntfy.sh
+        run: python scan.py
