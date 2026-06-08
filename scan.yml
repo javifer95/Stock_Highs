@@ -1,19 +1,16 @@
 name: Daily outperformance scan
 
-# Runs after the US market close. Cron is in UTC and GitHub does NOT adjust for
+# Runs after the US market close. Cron is UTC and GitHub does NOT adjust for
 # daylight saving, so this fires at 22:00 UTC year-round:
-#   - EDT (summer): 6:00 PM ET  (2h after the 4 PM close)
-#   - EST (winter): 5:00 PM ET  (1h after close)
-# That's enough lag for Yahoo's end-of-day data to settle. Weekdays only.
-# Note: GitHub's scheduler can run a few minutes late under load — that's fine
-# for end-of-day data. You can also trigger it by hand from the Actions tab.
+#   - EDT (summer): 6:00 PM ET   - EST (winter): 5:00 PM ET
+# Enough lag for Yahoo's end-of-day data to settle. Weekdays only.
+# You can also trigger it by hand from the Actions tab (workflow_dispatch).
 
 on:
   schedule:
     - cron: "0 22 * * 1-5"
-  workflow_dispatch: {}   # manual "Run workflow" button
+  workflow_dispatch: {}
 
-# Avoid overlapping runs if one is slow.
 concurrency:
   group: scan
   cancel-in-progress: false
@@ -21,7 +18,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +28,18 @@ jobs:
           cache: pip
 
       - run: pip install -r requirements.txt
+
+      # Carry the price-history cache between runs. The first few runs backfill
+      # the whole market a couple thousand names at a time; afterwards each run
+      # only refreshes the liquid names. restore-keys grabs the most recent
+      # cache; a fresh dated key is saved at the end of each run.
+      - name: Restore price cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: prices-${{ github.run_id }}
+          restore-keys: |
+            prices-
 
       - name: Run scanner
         env:
