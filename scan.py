@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-Whole-market end-of-day outperformance scanner.
+Whole-market end-of-day outperformance scanner (cached / rate-limit-safe).
 
-Once a day (run from GitHub Actions), this:
+Run once a day from GitHub Actions. It:
   1. Fetches the full list of US common stocks (NASDAQ + NYSE/other listings).
-  2. Downloads ~3 months of daily prices via yfinance.
-  3. For each stock, computes today's return *in excess of SPY* and expresses
-     it as a z-score against that stock's own recent excess-return distribution.
-  4. Keeps only liquid names (price + dollar-volume gates) whose move is
-     confirmed by above-average volume.
-  5. Pushes the survivors to your phone via ntfy.
+  2. Pulls daily prices via yfinance -- but NOT all at once. Yahoo rate-limits
+     thousands of requests from a cloud IP, so instead we keep a small on-disk
+     CACHE of price history (carried between runs by GitHub's Actions cache).
+       * The benchmark (SPY) is always fetched first, on its own, with retries.
+       * Each run refreshes the liquid names that could actually trigger an
+         alert, plus a rotating slice of everything else to fill/refresh the
+         cache. The first few runs backfill the whole market; after that each
+         run only touches ~a couple thousand names -- under Yahoo's limit.
+       * Partial coverage never aborts the run; we scan whatever is fresh.
+  3. For each stock with TODAY's bar, computes its return in excess of SPY as a
+     z-score against its own recent excess-return distribution, gated by price,
+     dollar-volume, and a volume-confirmation filter.
+  4. Pushes the survivors to your phone via ntfy.
 
-Nothing here needs an API key. The only secret is your ntfy topic name,
-read from the environment (set as a GitHub Actions secret).
+No API keys. The only secret is your ntfy topic name (a GitHub Actions secret).
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ from __future__ import annotations
 import io
 import os
 import sys
+import time
 import datetime as dt
 from dataclasses import dataclass
 
@@ -41,13 +48,23 @@ VOLUME_CONFIRM_MULT = 1.5    # today's volume must exceed this x median volume
 MIN_PRICE = 5.0              # ignore sub-$5 stocks (penny-stock noise)
 MIN_AVG_DOLLAR_VOLUME = 5_000_000   # ignore illiquid names (< $5M traded/day)
 
-MAX_ALERTS = 15              # safety cap so a crazy market day can't spam you
-DOWNLOAD_CHUNK = 150         # tickers per yfinance request
-HISTORY_PERIOD = "5mo"       # calendar history to pull (must exceed LOOKBACK)
+MAX_ALERTS = 15             # safety cap so a crazy market day can't spam you
+HISTORY_PERIOD = "5mo"      # calendar history to pull per ticker
+
+# --- rate-limit / caching knobs ---
+PER_RUN_FETCH_CAP = 2200    # max tickers to fetch in one run (under Yahoo's limit)
+DOWNLOAD_BATCH = 200        # tickers per yfinance call
+SLEEP_BETWEEN_BATCHES = 1.5  # seconds to pause between batches (be polite)
+MAX_BATCH_RETRIES = 3       # retries per batch on rate-limit/empty
+SPY_RETRIES = 5             # the benchmark gets extra retries; the run needs it
+CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
+CACHE_MAX_ROWS = 90         # trading days of history to keep in the cache
 
 NASDAQ_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
+# Note: an unset GitHub secret is passed as "" (empty), not absent, so a plain
+# default in .get() wouldn't catch it. `or` handles both None and "".
 NTFY_SERVER = (os.environ.get("NTFY_SERVER") or "https://ntfy.sh").rstrip("/")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
@@ -63,7 +80,7 @@ class Hit:
 
 
 # --------------------------------------------------------------------------
-# SIGNAL  --  pure function, unit-testable with synthetic data.
+# SIGNAL  --  pure function, unit-testable with synthetic data. (UNCHANGED)
 # --------------------------------------------------------------------------
 
 def evaluate_ticker(
@@ -144,7 +161,7 @@ def evaluate_ticker(
 
 
 # --------------------------------------------------------------------------
-# DATA  --  universe + prices.
+# UNIVERSE
 # --------------------------------------------------------------------------
 
 def fetch_universe() -> list[str]:
@@ -153,7 +170,6 @@ def fetch_universe() -> list[str]:
 
     def parse(url: str, symbol_col: str):
         txt = requests.get(url, timeout=30).text
-        # Files are pipe-delimited with a trailing "File Creation Time" footer.
         lines = [ln for ln in txt.splitlines() if ln and "File Creation Time" not in ln]
         df = pd.read_csv(io.StringIO("\n".join(lines)), sep="|")
         df = df[df.get("Test Issue", "N") == "N"]
@@ -161,7 +177,6 @@ def fetch_universe() -> list[str]:
             df = df[df["ETF"] != "Y"]
         for raw in df[symbol_col].dropna().astype(str):
             sym = raw.strip().upper()
-            # Skip preferreds/warrants/units; normalize class shares for yfinance.
             if any(c in sym for c in ("$", "+", "=")) or not sym:
                 continue
             sym = sym.replace(".", "-")
@@ -173,35 +188,148 @@ def fetch_universe() -> list[str]:
     return sorted(tickers)
 
 
-def download_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Batch-download daily OHLCV; returns {ticker: DataFrame[Close, Volume]}."""
+# --------------------------------------------------------------------------
+# CACHE  (two wide DataFrames: closes and volumes, dates x tickers)
+# --------------------------------------------------------------------------
+
+def _cache_paths() -> tuple[str, str]:
+    return (os.path.join(CACHE_DIR, "closes.parquet"),
+            os.path.join(CACHE_DIR, "volumes.parquet"))
+
+
+def load_cache() -> tuple[pd.DataFrame, pd.DataFrame]:
+    cp, vp = _cache_paths()
+    try:
+        closes = pd.read_parquet(cp)
+        volumes = pd.read_parquet(vp)
+        closes.index = pd.to_datetime(closes.index)
+        volumes.index = pd.to_datetime(volumes.index)
+        print(f"  cache: {closes.shape[1]} tickers, {closes.shape[0]} days")
+        return closes, volumes
+    except Exception:
+        print("  cache: empty (first run or not yet built)")
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def save_cache(closes: pd.DataFrame, volumes: pd.DataFrame) -> None:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cp, vp = _cache_paths()
+    closes.to_parquet(cp)
+    volumes.to_parquet(vp)
+    print(f"  cache saved: {closes.shape[1]} tickers, {closes.shape[0]} days")
+
+
+def merge_into_cache(closes, volumes, fetched: dict[str, pd.DataFrame]):
+    """Fold freshly downloaded data into the cached wide frames (new wins)."""
+    if not fetched:
+        return closes, volumes
+    nc = pd.DataFrame({t: df["Close"] for t, df in fetched.items()})
+    nv = pd.DataFrame({t: df["Volume"] for t, df in fetched.items()})
+    nc.index = pd.to_datetime(nc.index)
+    nv.index = pd.to_datetime(nv.index)
+    # combine_first: freshly fetched values take precedence; union of cols/dates.
+    closes = nc.combine_first(closes) if not closes.empty else nc
+    volumes = nv.combine_first(volumes) if not volumes.empty else nv
+    closes = closes.sort_index().tail(CACHE_MAX_ROWS)
+    volumes = volumes.sort_index().reindex(closes.index)
+    return closes, volumes
+
+
+# --------------------------------------------------------------------------
+# DOWNLOAD  (throttled, retrying, partial-OK)
+# --------------------------------------------------------------------------
+
+def _download_once(chunk: list[str]) -> dict[str, pd.DataFrame]:
+    data = yf.download(
+        chunk, period=HISTORY_PERIOD, interval="1d", auto_adjust=True,
+        group_by="ticker", threads=True, progress=False,
+    )
     out: dict[str, pd.DataFrame] = {}
-    for i in range(0, len(tickers), DOWNLOAD_CHUNK):
-        chunk = tickers[i : i + DOWNLOAD_CHUNK]
+    if data is None or data.empty:
+        return out
+    for t in chunk:
         try:
-            data = yf.download(
-                chunk,
-                period=HISTORY_PERIOD,
-                interval="1d",
-                auto_adjust=True,
-                group_by="ticker",
-                threads=True,
-                progress=False,
-            )
-        except Exception as e:  # network hiccup on one chunk shouldn't kill the run
-            print(f"  chunk {i//DOWNLOAD_CHUNK} failed: {e}", file=sys.stderr)
+            sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
+            df = sub[["Close", "Volume"]].dropna(how="all")
+            if not df.empty:
+                out[t] = df
+        except (KeyError, TypeError):
             continue
-        if data is None or data.empty:
-            continue
-        for t in chunk:
-            try:
-                sub = data[t] if isinstance(data.columns, pd.MultiIndex) else data
-                df = sub[["Close", "Volume"]].dropna(how="all")
-                if not df.empty:
-                    out[t] = df
-            except (KeyError, TypeError):
-                continue
     return out
+
+
+def download_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    """Download in throttled batches; retry rate-limited batches; keep what we get."""
+    out: dict[str, pd.DataFrame] = {}
+    n_batches = (len(tickers) + DOWNLOAD_BATCH - 1) // DOWNLOAD_BATCH
+    for bi in range(n_batches):
+        chunk = tickers[bi * DOWNLOAD_BATCH:(bi + 1) * DOWNLOAD_BATCH]
+        for attempt in range(MAX_BATCH_RETRIES):
+            try:
+                got = _download_once(chunk)
+            except Exception as e:
+                got = {}
+                msg = str(e).lower()
+                if "too many" not in msg and "rate" not in msg:
+                    print(f"    batch {bi} error: {e}", file=sys.stderr)
+            if got:
+                out.update(got)
+                break
+            # nothing came back -> likely rate-limited; back off and retry
+            time.sleep(5 * (attempt + 1) ** 2)
+        time.sleep(SLEEP_BETWEEN_BATCHES)
+        if (bi + 1) % 5 == 0:
+            print(f"    {bi + 1}/{n_batches} batches, {len(out)} tickers so far")
+    return out
+
+
+def download_benchmark() -> pd.DataFrame | None:
+    """Fetch SPY on its own, with extra retries. The run depends on it."""
+    for attempt in range(SPY_RETRIES):
+        got = {}
+        try:
+            got = _download_once([BENCHMARK])
+        except Exception as e:
+            print(f"  SPY attempt {attempt+1} error: {e}", file=sys.stderr)
+        if BENCHMARK in got:
+            return got[BENCHMARK]
+        time.sleep(5 * (attempt + 1) ** 2)
+    return None
+
+
+# --------------------------------------------------------------------------
+# FETCH-LIST SELECTION
+# --------------------------------------------------------------------------
+
+def is_liquid_in_cache(t, closes, volumes) -> bool:
+    if closes.empty or t not in closes.columns:
+        return False
+    c = closes[t].dropna()
+    if len(c) < LOOKBACK_DAYS or float(c.iloc[-1]) < MIN_PRICE:
+        return False
+    v = volumes[t].reindex(c.index)
+    adv = float((c * v).tail(LOOKBACK_DAYS).mean())
+    return np.isfinite(adv) and adv >= MIN_AVG_DOLLAR_VOLUME
+
+
+def select_fetch_list(universe, closes, volumes, today_ordinal) -> list[str]:
+    """Liquid names (must refresh daily) + a rotating slice of the rest."""
+    liquid = [t for t in universe if is_liquid_in_cache(t, closes, volumes)]
+    liquid_set = set(liquid)
+    rest = [t for t in universe if t not in liquid_set]
+
+    room = max(0, PER_RUN_FETCH_CAP - len(liquid))
+    if rest and room:
+        start = (today_ordinal * room) % len(rest)
+        rotated = rest[start:] + rest[:start]
+        discovery = rotated[:room]
+    else:
+        discovery = []
+
+    fetch_list = (liquid + discovery)[:PER_RUN_FETCH_CAP]
+    print(f"  fetch list: {len(liquid)} liquid + {len(discovery)} discovery "
+          f"= {len(fetch_list)} (universe {len(universe)})")
+    return fetch_list
 
 
 # --------------------------------------------------------------------------
@@ -211,27 +339,21 @@ def download_prices(tickers: list[str]) -> dict[str, pd.DataFrame]:
 def send_alert(hits: list[Hit], as_of: str) -> None:
     if not NTFY_TOPIC:
         print("NTFY_TOPIC not set; printing instead of pushing.", file=sys.stderr)
-    lines = []
-    for h in hits:
-        lines.append(
-            f"{h.ticker}  +{h.stock_ret*100:.1f}%  "
-            f"({h.excess_ret*100:+.1f}% vs SPY, z={h.z:.1f})  ${h.price:,.2f}"
-        )
+    lines = [
+        f"{h.ticker}  +{h.stock_ret*100:.1f}%  "
+        f"({h.excess_ret*100:+.1f}% vs SPY, z={h.z:.1f})  ${h.price:,.2f}"
+        for h in hits
+    ]
     body = "\n".join(lines)
-    title = f"{len(hits)} stock(s) far outperforming — {as_of}"
+    title = f"{len(hits)} stock(s) far outperforming -- {as_of}"
     print(f"\n{title}\n{body}")
-
     if not NTFY_TOPIC:
         return
     url = f"{NTFY_SERVER}/{NTFY_TOPIC}"
     resp = requests.post(
-        url,
-        data=body.encode("utf-8"),
-        headers={
-            "Title": title,
-            "Priority": "default",
-            "Tags": "chart_with_upwards_trend",
-        },
+        url, data=body.encode("utf-8"),
+        headers={"Title": title, "Priority": "default",
+                 "Tags": "chart_with_upwards_trend"},
         timeout=30,
     )
     resp.raise_for_status()
@@ -246,39 +368,60 @@ def main() -> int:
     print("Fetching universe...")
     universe = fetch_universe()
     print(f"  {len(universe)} candidate tickers")
-    # SPY is needed as the benchmark; make sure it's in the download set.
-    to_download = sorted(set(universe) | {BENCHMARK})
 
-    print("Downloading prices (this is the slow part)...")
-    prices = download_prices(to_download)
-    print(f"  got data for {len(prices)} tickers")
+    print("Loading cache...")
+    closes, volumes = load_cache()
 
-    if BENCHMARK not in prices:
-        print(f"ERROR: no data for benchmark {BENCHMARK}; aborting.", file=sys.stderr)
+    print("Fetching benchmark (SPY) first...")
+    spy_df = download_benchmark()
+    if spy_df is None:
+        print("ERROR: could not fetch SPY after retries; aborting this run.",
+              file=sys.stderr)
         return 1
+    closes, volumes = merge_into_cache(closes, volumes, {BENCHMARK: spy_df})
 
-    spy_close = prices[BENCHMARK]["Close"].dropna()
+    spy_close = closes[BENCHMARK].dropna()
     spy_ret = spy_close.pct_change()
-    as_of = spy_close.index[-1].date().isoformat()
+    as_of_ts = spy_close.index[-1]
+    as_of = as_of_ts.date().isoformat()
 
-    # Freshness guard: don't re-alert on stale data (holidays, Yahoo lag).
-    age_days = (dt.date.today() - spy_close.index[-1].date()).days
-    if age_days > 3:
+    age_days = (dt.date.today() - as_of_ts.date()).days
+    if age_days > 4:
         print(f"Latest data is {age_days} days old ({as_of}); likely a holiday. Skipping.")
+        save_cache(closes, volumes)
         return 0
 
+    print("Selecting fetch list...")
+    fetch_list = select_fetch_list(universe, closes, volumes, as_of_ts.toordinal())
+    fetch_list = [t for t in fetch_list if t != BENCHMARK]
+
+    print("Downloading prices (throttled)...")
+    fetched = download_prices(fetch_list)
+    print(f"  fetched {len(fetched)} tickers this run")
+    closes, volumes = merge_into_cache(closes, volumes, fetched)
+    save_cache(closes, volumes)
+
+    # Scan every cached ticker that has TODAY's bar.
     print("Scanning...")
     hits: list[Hit] = []
-    for t, df in prices.items():
+    eligible = 0
+    for t in closes.columns:
         if t == BENCHMARK:
             continue
-        hit = evaluate_ticker(t, df["Close"], df["Volume"], spy_ret)
+        col = closes[t]
+        lvi = col.last_valid_index()
+        if lvi is None or lvi != as_of_ts:   # no fresh bar today -> skip
+            continue
+        eligible += 1
+        hit = evaluate_ticker(t, col, volumes[t], spy_ret)
         if hit:
             hits.append(hit)
 
-    hits.sort(key=lambda h: h.z, reverse=True)
-    print(f"  {len(hits)} hit(s) before cap")
+    cov = (eligible / max(1, len(universe))) * 100
+    print(f"  {eligible} tickers had today's bar (~{cov:.0f}% of universe), "
+          f"{len(hits)} hit(s)")
 
+    hits.sort(key=lambda h: h.z, reverse=True)
     if not hits:
         print("Nothing far-outperforming today. No notification sent.")
         return 0

@@ -1,9 +1,8 @@
 # Stock Outperformance Alerts
 
-A free, zero-server tool that scans the whole US stock market once a day after
-the close and pushes a notification to your iPhone when a stock is *far*
-outperforming the market. No app to build, no Apple Developer account, no
-recurring cost.
+A free, zero-server tool that scans the US stock market once a day after the
+close and pushes a notification to your iPhone when a stock is *far*
+outperforming the market. No app to build, no Apple Developer account, no cost.
 
 ## How it works
 
@@ -11,67 +10,69 @@ recurring cost.
 GitHub Actions (daily cron)
    -> scan.py
         -> fetch US common-stock list (NASDAQ/NYSE symbol files)
-        -> download ~3 months of daily prices (yfinance)
-        -> compute today's return in excess of SPY, as a z-score
+        -> fetch SPY first (benchmark), then refresh prices via yfinance
+           using a CACHE so we never hammer Yahoo with thousands of requests
+        -> compute each stock's return in excess of SPY, as a z-score
         -> keep liquid names with volume-confirmed moves
-        -> POST survivors to ntfy
-                -> push notification on your phone
+        -> POST survivors to ntfy  -> push notification on your phone
 ```
+
+### Why the cache (important)
+
+Yahoo rate-limits thousands of rapid requests from a cloud IP, so the scanner
+cannot pull all ~7,000 tickers at once. Instead it keeps a small price-history
+cache that GitHub's Actions cache carries between runs:
+
+- **SPY is always fetched first**, on its own, with retries -- the run never
+  dies for lack of a benchmark.
+- The **first few daily runs backfill** the whole market a couple thousand
+  names at a time. Expect partial coverage (and possibly no alerts) for the
+  first ~3-4 runs while the cache fills.
+- After that, each run only refreshes the **liquid** names that could actually
+  trigger an alert, which stays under Yahoo's limit indefinitely.
+- Partial coverage never crashes the run; it scans whatever is fresh and prints
+  the coverage %. You'll see this in the run log.
 
 ## The signal
 
-For each stock: `excess = stock_daily_return - SPY_daily_return`. Today's excess
-return is converted to a **z-score** against the stock's own prior 60 trading
-days of excess returns. A hit requires **all** of:
+`excess = stock_daily_return - SPY_daily_return`, converted to a z-score against
+the stock's own prior 60 trading days. A hit requires ALL of:
 
-- z-score >= **3.0** (today's move is 3+ std devs beyond the stock's normal)
-- excess return is positive (upside only)
-- price >= **$5** (no penny stocks)
-- average daily dollar volume >= **$5,000,000** (liquid enough to matter)
-- today's volume >= **1.5x** its recent median (the move is real, not a fluke)
+- z-score >= **3.0**, and the move is to the upside
+- price >= **$5** and average daily dollar volume >= **$5,000,000**
+- today's volume >= **1.5x** its recent median
 
-All of these live in the CONFIG block at the top of `scan.py` — tune freely.
-Raise `Z_THRESHOLD` for fewer/stronger alerts; lower it for more.
+All tunable in the CONFIG block of `scan.py`. Raise `Z_THRESHOLD` for fewer,
+stronger alerts.
 
-## One-time setup (about 10 minutes)
+## One-time setup
 
-1. **Install the ntfy app** on your iPhone (App Store, free). Open it, tap "+",
-   and subscribe to a topic with a long random name you choose, e.g.
-   `stock-alerts-8fk39dlz`. Anyone who knows the name can read the topic, so
-   keep it unguessable (or self-host ntfy later if you care).
+1. **Install the ntfy app** (iPhone, free) and subscribe to a long random topic
+   name, e.g. `stock-alerts-8fk39dlz`.
+2. Put these files in a **GitHub repo** (public = unlimited free Actions).
+3. Add the topic as a secret: Settings -> Secrets and variables -> Actions ->
+   New repository secret, named `NTFY_TOPIC`.
+4. Actions tab -> enable workflows -> **Run workflow** to test.
 
-2. **Create a GitHub repo** and add these files. A **public** repo gives you
-   unlimited free Actions minutes; a private one gets 2,000 free min/month,
-   which is also plenty (each run takes a few minutes).
-
-3. **Add the topic as a secret:** repo Settings -> Secrets and variables ->
-   Actions -> New repository secret. Name it `NTFY_TOPIC`, value is your topic
-   name from step 1. (Optional `NTFY_SERVER` secret only if you self-host.)
-
-4. **Enable Actions** (Actions tab -> enable workflows). Then click into
-   "Daily outperformance scan" -> **Run workflow** to test it immediately
-   instead of waiting for the schedule.
-
-That's it. It now runs itself every weekday after the close.
+Run it a few days in a row (or click Run workflow a few times) to let the cache
+warm up to full coverage.
 
 ## Testing locally
 
 ```bash
 pip install -r requirements.txt
-NTFY_TOPIC=your-topic-name python scan.py     # real push
-python scan.py                                # no topic -> prints to console
-python test_signal.py                         # unit-test the signal math
+NTFY_TOPIC=your-topic python scan.py     # real push
+python scan.py                           # no topic -> prints to console
+python test_signal.py                    # signal math
+python test_cache.py                     # cache + end-to-end (mocked network)
 ```
 
-## Known limitations / honest caveats
+## Honest caveats
 
-- **yfinance is unofficial** (it scrapes Yahoo) and breaks occasionally. If a
-  run fails, it's usually this. Stooq bulk CSV is a free fallback data source.
-- **EOD only.** This tells you what already happened today, after the close —
-  it is not an intraday or trading signal.
-- **Symbol mapping is imperfect.** Some class shares / special tickers may not
-  resolve in yfinance and get silently skipped.
-- **"Outperforming" = attention, not opportunity.** A name that's already
-  spiked is often already priced in. Decide what you'll actually do with these.
-- GitHub may **disable scheduled workflows** on a repo with no activity for 60
-  days; just push a commit or click Run workflow to keep it alive.
+- **yfinance is unofficial** and rate-limits hard from cloud IPs; the cache is
+  the workaround. Coverage builds over the first few runs.
+- **EOD only** -- this reports what already happened; it is not a trading signal.
+- **"Outperforming" = attention, not opportunity.** A name that already spiked
+  is often already priced in.
+- GitHub disables scheduled workflows after 60 days of repo inactivity; a commit
+  or manual run resets that.
