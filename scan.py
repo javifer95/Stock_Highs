@@ -336,9 +336,17 @@ def select_fetch_list(universe, closes, volumes, today_ordinal) -> list[str]:
 # ALERT
 # --------------------------------------------------------------------------
 
+def _clean_topic(raw: str) -> str:
+    """Accept a bare topic ("abc123") OR a full URL pasted by mistake
+    ("https://ntfy.sh/abc123") and return just the topic segment. A full URL in
+    the secret is the usual cause of a 404 (the path ends up doubled)."""
+    t = (raw or "").strip().strip("/")
+    if "/" in t:
+        t = t.split("/")[-1]
+    return t
+
+
 def send_alert(hits: list[Hit], as_of: str) -> None:
-    if not NTFY_TOPIC:
-        print("NTFY_TOPIC not set; printing instead of pushing.", file=sys.stderr)
     lines = [
         f"{h.ticker}  +{h.stock_ret*100:.1f}%  "
         f"({h.excess_ret*100:+.1f}% vs SPY, z={h.z:.1f})  ${h.price:,.2f}"
@@ -347,17 +355,35 @@ def send_alert(hits: list[Hit], as_of: str) -> None:
     body = "\n".join(lines)
     title = f"{len(hits)} stock(s) far outperforming -- {as_of}"
     print(f"\n{title}\n{body}")
-    if not NTFY_TOPIC:
+
+    topic = _clean_topic(NTFY_TOPIC)
+    if not topic:
+        print("NTFY_TOPIC not set; printed above instead of pushing.", file=sys.stderr)
         return
-    url = f"{NTFY_SERVER}/{NTFY_TOPIC}"
-    resp = requests.post(
-        url, data=body.encode("utf-8"),
-        headers={"Title": title, "Priority": "default",
-                 "Tags": "chart_with_upwards_trend"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    print(f"Pushed to {url}")
+
+    server = NTFY_SERVER if "://" in NTFY_SERVER else f"https://{NTFY_SERVER}"
+    url = f"{server}/{topic}"
+    masked = f"{server}/{topic[:3]}***"   # don't leak the full topic in logs
+
+    # A delivery hiccup must NOT fail an otherwise-successful scan, so we log
+    # the real reason instead of raising.
+    try:
+        resp = requests.post(
+            url, data=body.encode("utf-8"),
+            headers={"Title": title, "Priority": "default",
+                     "Tags": "chart_with_upwards_trend"},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            print(f"ntfy POST to {masked} failed: HTTP {resp.status_code} -> "
+                  f"{resp.text[:200]}", file=sys.stderr)
+            print("Fix: NTFY_TOPIC should be ONLY the topic name (e.g. "
+                  "'stock-alerts-8fk39dlz'), not the full URL, and must match "
+                  "what you subscribed to in the ntfy app.", file=sys.stderr)
+        else:
+            print(f"Pushed to {masked}")
+    except Exception as e:
+        print(f"ntfy POST error ({masked}): {e}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
